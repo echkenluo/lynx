@@ -132,13 +132,92 @@ func (r *PolicyReconciler) ReconcilePatch(req ctrl.Request) (ctrl.Result, error)
 	return ctrl.Result{Requeue: requeue}, nil
 }
 
+func (r *PolicyReconciler) ReconcileEndpoint(req ctrl.Request) (ctrl.Result, error) {
+	var endpoint securityv1alpha1.Endpoint
+	var ctx = context.Background()
+	var err error
+
+	r.reconcilerLock.Lock()
+	defer r.reconcilerLock.Unlock()
+
+	err = r.Get(ctx, req.NamespacedName, &endpoint)
+	if client.IgnoreNotFound(err) != nil {
+		klog.Errorf("unable to fetch endpoint %s: %s", req.Name, err.Error())
+		return ctrl.Result{}, err
+	}
+
+	endpointReferencePolicy := r.endpointReferencePolicy(ctx, endpoint)
+	for i, policy := range endpointReferencePolicy {
+		var errList []error
+
+		newRuleList, err := r.calculateExpectedPolicyRules(&endpointReferencePolicy[i])
+		if err != nil {
+			klog.Errorf("failed compute newRule for endpoint %s from policy %s, error: %s",
+				endpoint.Name, policy.Name, err)
+			return ctrl.Result{}, nil
+		}
+
+		for _, newRule := range newRuleList.Items {
+			if err := r.Create(ctx, newRule.DeepCopy()); !apierrors.IsAlreadyExists(err) {
+				errList = append(errList, err)
+			}
+		}
+
+		if len(errList) > 0 {
+			klog.Errorf("failed to create newRule for endpoint: %s, error: %s",
+				endpoint.Name, errors.NewAggregate(errList))
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *PolicyReconciler) endpointReferencePolicy(ctx context.Context,
+	endpoint securityv1alpha1.Endpoint) []securityv1alpha1.SecurityPolicy {
+	var policyList securityv1alpha1.SecurityPolicyList
+	var referencePolicyList []securityv1alpha1.SecurityPolicy
+
+	err := r.List(ctx, &policyList)
+	if client.IgnoreNotFound(err) != nil {
+		klog.Errorf("failed fetch policyList, error: %s", err)
+		return referencePolicyList
+	}
+
+	for _, policy := range policyList.Items {
+		policyReferenceEndpoints := getPolicyReferenceEndpoints(policy)
+		for _, ep := range policyReferenceEndpoints {
+			if ep == endpoint.Name {
+				referencePolicyList = append(referencePolicyList, policy)
+				break
+			}
+		}
+	}
+
+	return referencePolicyList
+}
+
+func getPolicyReferenceEndpoints(policy securityv1alpha1.SecurityPolicy) []string {
+	var referencedEndpoints []string
+
+	referencedEndpoints = append(referencedEndpoints, policy.Spec.AppliedTo.Endpoints...)
+
+	for _, rule := range policy.Spec.IngressRules {
+		referencedEndpoints = append(referencedEndpoints, rule.From.Endpoints...)
+	}
+	for _, rule := range policy.Spec.EgressRules {
+		referencedEndpoints = append(referencedEndpoints, rule.To.Endpoints...)
+	}
+
+	return referencedEndpoints
+}
+
 func (r *PolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if mgr == nil {
 		return fmt.Errorf("can't setup with nil manager")
 	}
 
 	var err error
-	var policyController, patchController controller.Controller
+	var policyController, patchController, endpointController controller.Controller
 
 	// ignore not empty ruleCache for future cache inject
 	if r.ruleCache == nil {
@@ -191,6 +270,19 @@ func (r *PolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			r.groupCache.DelGroupMembership(e.Meta.GetName())
 		},
 	})
+	if err != nil {
+		return err
+	}
+
+	endpointController, err = controller.New("endpoint-controller", mgr, controller.Options{
+		MaxConcurrentReconciles: lynxctrl.DefaultMaxConcurrentReconciles,
+		Reconciler:              reconcile.Func(r.ReconcileEndpoint),
+	})
+	if err != nil {
+		return err
+	}
+
+	err = endpointController.Watch(&source.Kind{Type: &securityv1alpha1.Endpoint{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
 	}
@@ -330,6 +422,7 @@ func (r *PolicyReconciler) completePolicy(policy *securityv1alpha1.SecurityPolic
 	appliedToPeer := securityv1alpha1.SecurityPolicyPeer{
 		IPBlocks:       nil,
 		EndpointGroups: policy.Spec.AppliedTo.EndpointGroups,
+		Endpoints:      policy.Spec.AppliedTo.Endpoints,
 	}
 	appliedGroups, appliedIPBlocks, err := r.getPeerGroupsAndIPBlocks(&appliedToPeer)
 	if err != nil {
@@ -453,6 +546,20 @@ func (r *PolicyReconciler) getPeerGroupsAndIPBlocks(peer *securityv1alpha1.Secur
 
 	for _, ipBlock := range peer.IPBlocks {
 		ipBlocks[fmt.Sprintf("%s/%d", ipBlock.IP, ipBlock.PrefixLength)]++
+	}
+
+	for _, ep := range peer.Endpoints {
+		var endpoint securityv1alpha1.Endpoint
+		ctx := context.Background()
+		err := r.Get(ctx, k8stypes.NamespacedName{Name: ep}, &endpoint)
+		if err != nil {
+			klog.Infof("failed to get endpoint: %v, error: %v", ep, err)
+			continue
+		}
+
+		for _, ip := range endpoint.Status.IPs {
+			ipBlocks[ip.String()]++
+		}
 	}
 
 	return groups, ipBlocks, nil
