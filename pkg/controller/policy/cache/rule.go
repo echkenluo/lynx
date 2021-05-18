@@ -46,8 +46,10 @@ type CompleteRule struct {
 
 	// SrcGroups is a map of groupName and revision. Revision is used to determine whether
 	// a patch has been executed for this group.
-	SrcGroups map[string]int32
-	DstGroups map[string]int32
+	SrcGroups    map[string]int32
+	DstGroups    map[string]int32
+	SrcEndpoints map[string][]string
+	DstEndpoints map[string][]string
 
 	// SrcIPBlocks is a map of source IPBlocks and appear times. This schema is used to calculate
 	// whether the patch leads to the added/deleted of IPBlocks. Virtual machine hot migration or
@@ -197,8 +199,9 @@ func applyCountMap(count map[string]int, added, deled []string) (new []string, o
 }
 
 const (
-	GroupIndex  = "GroupIndex"
-	PolicyIndex = "PolicyIndex"
+	GroupIndex    = "GroupIndex"
+	PolicyIndex   = "PolicyIndex"
+	EndpointIndex = "EndpointIndex"
 )
 
 func ruleKeyFunc(obj interface{}) (string, error) {
@@ -219,12 +222,22 @@ func policyIndexFunc(obj interface{}) ([]string, error) {
 	return []string{policyName}, nil
 }
 
+func endpointIndexFunc(obj interface{}) ([]string, error) {
+	rule := obj.(*CompleteRule)
+	srcEndpoints := sets.StringKeySet(rule.SrcEndpoints)
+	dstEndpoints := sets.StringKeySet(rule.DstEndpoints)
+	endpoints := srcEndpoints.Union(dstEndpoints)
+
+	return endpoints.UnsortedList(), nil
+}
+
 func NewCompleteRuleCache() cache.Indexer {
 	return cache.NewIndexer(
 		ruleKeyFunc,
 		cache.Indexers{
-			GroupIndex:  groupIndexFunc,
-			PolicyIndex: policyIndexFunc,
+			GroupIndex:    groupIndexFunc,
+			PolicyIndex:   policyIndexFunc,
+			EndpointIndex: endpointIndexFunc,
 		},
 	)
 }

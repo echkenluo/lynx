@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/barkimedes/go-deepcopy"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -44,6 +45,7 @@ import (
 	securityv1alpha1 "github.com/smartxworks/lynx/pkg/apis/security/v1alpha1"
 	lynxctrl "github.com/smartxworks/lynx/pkg/controller"
 	policycache "github.com/smartxworks/lynx/pkg/controller/policy/cache"
+	"github.com/smartxworks/lynx/pkg/utils"
 )
 
 type PolicyReconciler struct {
@@ -132,44 +134,186 @@ func (r *PolicyReconciler) ReconcilePatch(req ctrl.Request) (ctrl.Result, error)
 	return ctrl.Result{Requeue: requeue}, nil
 }
 
-func (r *PolicyReconciler) ReconcileEndpoint(req ctrl.Request) (ctrl.Result, error) {
-	var endpoint securityv1alpha1.Endpoint
-	var ctx = context.Background()
-	var err error
+// func (r *PolicyReconciler) ReconcileEndpoint(req ctrl.Request) (ctrl.Result, error) {
+// 	var endpoint securityv1alpha1.Endpoint
+// 	var ctx = context.Background()
+// 	var err error
 
-	r.reconcilerLock.Lock()
-	defer r.reconcilerLock.Unlock()
+// 	r.reconcilerLock.Lock()
+// 	defer r.reconcilerLock.Unlock()
 
-	err = r.Get(ctx, req.NamespacedName, &endpoint)
-	if client.IgnoreNotFound(err) != nil {
-		klog.Errorf("unable to fetch endpoint %s: %s", req.Name, err.Error())
-		return ctrl.Result{}, err
+// 	err = r.Get(ctx, req.NamespacedName, &endpoint)
+// 	if client.IgnoreNotFound(err) != nil {
+// 		klog.Errorf("unable to fetch endpoint %s: %s", req.Name, err.Error())
+// 		return ctrl.Result{}, err
+// 	}
+
+// 	if apierrors.IsNotFound(err) || !endpoint.DeletionTimestamp.IsZero() {
+// 		r.processEndpointDelete(ctx, endpoint)
+// 		return ctrl.Result{}, nil
+// 	}
+
+// 	// if policyrule update is needed
+// 	completeRules, _ := r.ruleCache.ByIndex(policycache.EndpointIndex, endpoint.Name)
+// 	for _, completeRule := range completeRules {
+// 		var rule = completeRule.(*policycache.CompleteRule)
+// 		prevEndpointIPSets := sets.NewString(rule.SrcEndpoints[endpoint.Name]...)
+// 		curEndpointIPSets := sets.NewString()
+
+// 		for _, ip := range endpoint.Status.IPs {
+// 			curEndpointIPSets.Insert(ip.String())
+// 		}
+// 		if curEndpointIPSets.Equal(prevEndpointIPSets) {
+// 			return ctrl.Result{}, nil
+// 		}
+// 	}
+
+// 	// r.processEndpointUpdate(ctx, endpoint)
+
+// 	// Fully update
+// 	// endpointReferencePolicy := r.endpointReferencePolicy(ctx, endpoint)
+// 	// for i := 0; i < len(endpointReferencePolicy); i++ {
+// 	// _, err = r.processPolicyUpdate(ctx, &endpointReferencePolicy[i])
+// 	// if err != nil {
+
+// 	// }
+// 	// }
+
+// 	return ctrl.Result{}, nil
+// }
+
+func (r *PolicyReconciler) AddEndpoint(e event.CreateEvent, queue workqueue.RateLimitingInterface) {
+	endpoint, ok := e.Object.(*securityv1alpha1.Endpoint)
+	if !ok {
+		klog.Errorf("process endpoint create event error, errors: unknow obj received")
 	}
 
-	endpointReferencePolicy := r.endpointReferencePolicy(ctx, endpoint)
-	for i, policy := range endpointReferencePolicy {
-		var errList []error
+	klog.Infof("policyReconciler process endpoint create event for endpoint : %v", endpoint.Name)
+}
 
-		newRuleList, err := r.calculateExpectedPolicyRules(&endpointReferencePolicy[i])
-		if err != nil {
-			klog.Errorf("failed compute newRule for endpoint %s from policy %s, error: %s",
-				endpoint.Name, policy.Name, err)
-			return ctrl.Result{}, nil
+func (r *PolicyReconciler) DeleteEndpoint(e event.DeleteEvent, queue workqueue.RateLimitingInterface) {
+	endpoint, ok := e.Object.(*securityv1alpha1.Endpoint)
+	if !ok {
+		klog.Errorf("DeleteEndpoint received with unavailable object event: %v", e)
+	}
+
+	klog.Infof("policyReconciler process endpoint delete event for endpoint: %v", endpoint.Name)
+
+	ctx := context.Background()
+	r.processEndpointDelete(ctx, *endpoint)
+}
+
+func (r *PolicyReconciler) UpdateEndpoint(e event.UpdateEvent, queue workqueue.RateLimitingInterface) {
+	newEndpoint, newOK := e.ObjectNew.(*securityv1alpha1.Endpoint)
+	oldEndpoint, oldOK := e.ObjectOld.(*securityv1alpha1.Endpoint)
+	klog.Infof("policyReconciler process endpoint update event for oldEndpoint: %v, newEndpoint: %v", oldEndpoint.Name, newEndpoint.Name)
+
+	if !(newOK && oldOK) {
+		klog.Errorf("DeleteEndpoint received with unavailable object event: %v", e)
+		return
+	}
+
+	if utils.EqualIPs(oldEndpoint.Status.IPs, newEndpoint.Status.IPs) {
+		return
+	}
+
+	ctx := context.Background()
+	r.processEndpointUpdate(ctx, *oldEndpoint, *newEndpoint)
+}
+
+func (r *PolicyReconciler) processEndpointDelete(ctx context.Context, endpoint securityv1alpha1.Endpoint) {
+	var newPolicyRuleList, oldPolicyRuleList policyv1alpha1.PolicyRuleList
+	completeRules, _ := r.ruleCache.ByIndex(policycache.EndpointIndex, endpoint.Name)
+
+	for _, completeRule := range completeRules {
+		var rule = completeRule.(*policycache.CompleteRule)
+		oldPolicyRuleList.Items = append(oldPolicyRuleList.Items, rule.ListRules().Items...)
+
+		sips, exist := rule.SrcEndpoints[endpoint.Name]
+		if exist {
+			for _, ip := range sips {
+				delete(rule.SrcIPBlocks, ip)
+				delete(rule.SrcEndpoints, endpoint.Name)
+			}
 		}
-
-		for _, newRule := range newRuleList.Items {
-			if err := r.Create(ctx, newRule.DeepCopy()); !apierrors.IsAlreadyExists(err) {
-				errList = append(errList, err)
+		dips, exist := rule.DstEndpoints[endpoint.Name]
+		if exist {
+			for _, ip := range dips {
+				delete(rule.DstIPBlocks, ip)
+				delete(rule.DstEndpoints, endpoint.Name)
 			}
 		}
 
-		if len(errList) > 0 {
-			klog.Errorf("failed to create newRule for endpoint: %s, error: %s",
-				endpoint.Name, errors.NewAggregate(errList))
+		newRule, _ := deepcopy.Anything(rule)
+		r.ruleCache.Update(newRule)
+
+		klog.Infof("##### endpoint update: oldRule is : %v, newRule is : %v\n", rule, newRule)
+
+		newPolicyRuleList.Items = append(newPolicyRuleList.Items, rule.ListRules().Items...)
+	}
+
+	r.syncPolicyRulesUntilSuccess(ctx, oldPolicyRuleList, newPolicyRuleList)
+}
+
+func (r *PolicyReconciler) processEndpointUpdate(ctx context.Context, oldEndpoint, newEndpoint securityv1alpha1.Endpoint) {
+	var newPolicyRuleList, oldPolicyRuleList policyv1alpha1.PolicyRuleList
+
+	oldCompleteRules, _ := r.ruleCache.ByIndex(policycache.EndpointIndex, oldEndpoint.Name)
+	for _, oldCompleteRule := range oldCompleteRules {
+		r.ruleCache.Delete(oldCompleteRule)
+	}
+
+	for _, oldCompleteRule := range oldCompleteRules {
+		var oldRule = oldCompleteRule.(*policycache.CompleteRule)
+		oldPolicyRuleList.Items = append(oldPolicyRuleList.Items, oldRule.ListRules().Items...)
+
+		newRule := r.updateCompleteRule(oldRule, newEndpoint)
+		klog.Infof("##### endpoint update: oldRule is : %v, newRule is : %v\n", oldRule, newRule)
+		r.ruleCache.Add(newRule)
+		newPolicyRuleList.Items = append(newPolicyRuleList.Items, newRule.ListRules().Items...)
+	}
+
+	// start a force full synchronization of policyrule
+	r.syncPolicyRulesUntilSuccess(ctx, oldPolicyRuleList, newPolicyRuleList)
+}
+
+func (r *PolicyReconciler) updateCompleteRule(completeRule *policycache.CompleteRule, endpoint securityv1alpha1.Endpoint) *policycache.CompleteRule {
+	// var newSrcEndpoints = policycache.DeepCopyMap(completeRule.SrcEndpoints).(map[string][]string)
+	// var newDstEndpoints = policycache.DeepCopyMap(completeRule.DstEndpoints).(map[string][]string)
+	// var newSrcIPBlocks = policycache.DeepCopyMap(completeRule.SrcIPBlocks).(map[string]int)
+	// var newDstIPBlocks = policycache.DeepCopyMap(completeRule.DstIPBlocks).(map[string]int)
+
+	sips, exist := completeRule.SrcEndpoints[endpoint.Name]
+	if exist {
+		delete(completeRule.SrcEndpoints, endpoint.Name)
+		for _, sip := range sips {
+			delete(completeRule.SrcIPBlocks, sip)
+		}
+		for _, newsip := range endpoint.Status.IPs {
+			completeRule.SrcEndpoints[endpoint.Name] = append(completeRule.SrcEndpoints[endpoint.Name], policycache.GetIPCidr(newsip))
+			completeRule.SrcIPBlocks[policycache.GetIPCidr(newsip)] = 1
 		}
 	}
 
-	return ctrl.Result{}, nil
+	dips, exist := completeRule.DstEndpoints[endpoint.Name]
+	if exist {
+		delete(completeRule.DstEndpoints, endpoint.Name)
+		for _, dip := range dips {
+			delete(completeRule.DstIPBlocks, dip)
+		}
+		for _, newdip := range endpoint.Status.IPs {
+			completeRule.DstEndpoints[endpoint.Name] = append(completeRule.DstEndpoints[endpoint.Name], newdip.String())
+			completeRule.DstIPBlocks[policycache.GetIPCidr(newdip)] = 1
+		}
+	}
+
+	obj, err := deepcopy.Anything(completeRule)
+	if err != nil {
+		klog.Errorf("failed to generate newCompleteRule obj from oldCompleteRule, error: %v", err)
+	}
+	newCompleteRule := obj.(*policycache.CompleteRule)
+
+	return newCompleteRule
 }
 
 func (r *PolicyReconciler) endpointReferencePolicy(ctx context.Context,
@@ -217,7 +361,7 @@ func (r *PolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	var err error
-	var policyController, patchController, endpointController controller.Controller
+	var policyController, patchController controller.Controller
 
 	// ignore not empty ruleCache for future cache inject
 	if r.ruleCache == nil {
@@ -274,15 +418,19 @@ func (r *PolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	endpointController, err = controller.New("endpoint-controller", mgr, controller.Options{
-		MaxConcurrentReconciles: lynxctrl.DefaultMaxConcurrentReconciles,
-		Reconciler:              reconcile.Func(r.ReconcileEndpoint),
-	})
-	if err != nil {
-		return err
-	}
+	// endpointController, err = controller.New("endpoint-controller", mgr, controller.Options{
+	// 	MaxConcurrentReconciles: lynxctrl.DefaultMaxConcurrentReconciles,
+	// 	Reconciler:              reconcile.Func(r.ReconcileEndpoint),
+	// })
+	// if err != nil {
+	// 	return err
+	// }
 
-	err = endpointController.Watch(&source.Kind{Type: &securityv1alpha1.Endpoint{}}, &handler.EnqueueRequestForObject{})
+	err = policyController.Watch(&source.Kind{Type: &securityv1alpha1.Endpoint{}}, &handler.Funcs{
+		CreateFunc: r.AddEndpoint,
+		DeleteFunc: r.DeleteEndpoint,
+		UpdateFunc: r.UpdateEndpoint,
+	})
 	if err != nil {
 		return err
 	}
@@ -424,27 +572,28 @@ func (r *PolicyReconciler) completePolicy(policy *securityv1alpha1.SecurityPolic
 		EndpointGroups: policy.Spec.AppliedTo.EndpointGroups,
 		Endpoints:      policy.Spec.AppliedTo.Endpoints,
 	}
-	appliedGroups, appliedIPBlocks, err := r.getPeerGroupsAndIPBlocks(&appliedToPeer)
+	appliedEndpoints, appliedGroups, appliedIPBlocks, err := r.getPeerGroupsAndIPBlocks(&appliedToPeer)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, rule := range policy.Spec.IngressRules {
 		ingressRule := &policycache.CompleteRule{
-			RuleID:      fmt.Sprintf("%s/%s.%s", policy.Name, "ingress", rule.Name),
-			Priority:    policy.Spec.Priority,
-			Tier:        policy.Spec.Tier,
-			Action:      policyv1alpha1.RuleActionAllow,
-			Direction:   policyv1alpha1.RuleDirectionIn,
-			DstGroups:   policycache.DeepCopyMap(appliedGroups).(map[string]int32),
-			DstIPBlocks: policycache.DeepCopyMap(appliedIPBlocks).(map[string]int),
+			RuleID:       fmt.Sprintf("%s/%s.%s", policy.Name, "ingress", rule.Name),
+			Priority:     policy.Spec.Priority,
+			Tier:         policy.Spec.Tier,
+			Action:       policyv1alpha1.RuleActionAllow,
+			Direction:    policyv1alpha1.RuleDirectionIn,
+			DstEndpoints: policycache.DeepCopyMap(appliedEndpoints).(map[string][]string),
+			DstGroups:    policycache.DeepCopyMap(appliedGroups).(map[string]int32),
+			DstIPBlocks:  policycache.DeepCopyMap(appliedIPBlocks).(map[string]int),
 		}
 
 		if len(rule.From.IPBlocks)+len(rule.From.EndpointGroups) == 0 {
 			// empty From matches all sources
 			ingressRule.SrcIPBlocks = map[string]int{"": 1}
 		} else {
-			ingressRule.SrcGroups, ingressRule.SrcIPBlocks, err = r.getPeerGroupsAndIPBlocks(&rule.From)
+			ingressRule.SrcEndpoints, ingressRule.SrcGroups, ingressRule.SrcIPBlocks, err = r.getPeerGroupsAndIPBlocks(&rule.From)
 			if err != nil {
 				return nil, err
 			}
@@ -465,20 +614,21 @@ func (r *PolicyReconciler) completePolicy(policy *securityv1alpha1.SecurityPolic
 
 	for _, rule := range policy.Spec.EgressRules {
 		egressRule := &policycache.CompleteRule{
-			RuleID:      fmt.Sprintf("%s/%s.%s", policy.Name, "egress", rule.Name),
-			Priority:    policy.Spec.Priority,
-			Tier:        policy.Spec.Tier,
-			Action:      policyv1alpha1.RuleActionAllow,
-			Direction:   policyv1alpha1.RuleDirectionOut,
-			SrcGroups:   policycache.DeepCopyMap(appliedGroups).(map[string]int32),
-			SrcIPBlocks: policycache.DeepCopyMap(appliedIPBlocks).(map[string]int),
+			RuleID:       fmt.Sprintf("%s/%s.%s", policy.Name, "egress", rule.Name),
+			Priority:     policy.Spec.Priority,
+			Tier:         policy.Spec.Tier,
+			Action:       policyv1alpha1.RuleActionAllow,
+			Direction:    policyv1alpha1.RuleDirectionOut,
+			SrcEndpoints: policycache.DeepCopyMap(appliedEndpoints).(map[string][]string),
+			SrcGroups:    policycache.DeepCopyMap(appliedGroups).(map[string]int32),
+			SrcIPBlocks:  policycache.DeepCopyMap(appliedIPBlocks).(map[string]int),
 		}
 
 		if len(rule.To.IPBlocks)+len(rule.To.EndpointGroups) == 0 {
 			// empty From matches all sources
 			egressRule.DstIPBlocks = map[string]int{"": 1}
 		} else {
-			egressRule.DstGroups, egressRule.DstIPBlocks, err = r.getPeerGroupsAndIPBlocks(&rule.To)
+			egressRule.DstEndpoints, egressRule.DstGroups, egressRule.DstIPBlocks, err = r.getPeerGroupsAndIPBlocks(&rule.To)
 			if err != nil {
 				return nil, err
 			}
@@ -504,6 +654,7 @@ func (r *PolicyReconciler) completePolicy(policy *securityv1alpha1.SecurityPolic
 		Action:            policyv1alpha1.RuleActionDrop,
 		Direction:         policyv1alpha1.RuleDirectionIn,
 		DefaultPolicyRule: true,
+		DstEndpoints:      policycache.DeepCopyMap(appliedEndpoints).(map[string][]string),
 		DstGroups:         policycache.DeepCopyMap(appliedGroups).(map[string]int32),
 		DstIPBlocks:       policycache.DeepCopyMap(appliedIPBlocks).(map[string]int),
 		SrcIPBlocks:       map[string]int{"": 1},      // matches all source IP
@@ -517,6 +668,7 @@ func (r *PolicyReconciler) completePolicy(policy *securityv1alpha1.SecurityPolic
 		Action:            policyv1alpha1.RuleActionDrop,
 		Direction:         policyv1alpha1.RuleDirectionOut,
 		DefaultPolicyRule: true,
+		SrcEndpoints:      policycache.DeepCopyMap(appliedEndpoints).(map[string][]string),
 		SrcGroups:         policycache.DeepCopyMap(appliedGroups).(map[string]int32),
 		SrcIPBlocks:       policycache.DeepCopyMap(appliedIPBlocks).(map[string]int),
 		DstIPBlocks:       map[string]int{"": 1},      // matches all destination IP
@@ -528,14 +680,16 @@ func (r *PolicyReconciler) completePolicy(policy *securityv1alpha1.SecurityPolic
 }
 
 // getPeerGroupsAndIPBlocks get ipBlocks from groups, return unique ipBlock list
-func (r *PolicyReconciler) getPeerGroupsAndIPBlocks(peer *securityv1alpha1.SecurityPolicyPeer) (map[string]int32, map[string]int, error) {
+func (r *PolicyReconciler) getPeerGroupsAndIPBlocks(peer *securityv1alpha1.SecurityPolicyPeer) (map[string][]string,
+	map[string]int32, map[string]int, error) {
 	var groups = make(map[string]int32)
 	var ipBlocks = make(map[string]int)
+	var endpoints = make(map[string][]string)
 
 	for group := range sets.NewString(peer.EndpointGroups...) {
 		revision, ipAddrs, exist := r.groupCache.ListGroupIPBlocks(group)
 		if !exist {
-			return nil, nil, groupNotFound(fmt.Errorf("group %s members not found", group))
+			return nil, nil, nil, groupNotFound(fmt.Errorf("group %s members not found", group))
 		}
 		groups[group] = revision
 
@@ -558,11 +712,12 @@ func (r *PolicyReconciler) getPeerGroupsAndIPBlocks(peer *securityv1alpha1.Secur
 		}
 
 		for _, ip := range endpoint.Status.IPs {
+			endpoints[endpoint.Name] = append(endpoints[endpoint.Name], ip.String())
 			ipBlocks[ip.String()]++
 		}
 	}
 
-	return groups, ipBlocks, nil
+	return endpoints, groups, ipBlocks, nil
 }
 
 func (r *PolicyReconciler) syncPolicyRulesUntilSuccess(ctx context.Context, oldRuleList, newRuleList policyv1alpha1.PolicyRuleList) {

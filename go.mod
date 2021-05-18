@@ -4,6 +4,7 @@ go 1.15
 
 require (
 	github.com/agiledragon/gomonkey v2.0.2+incompatible
+	github.com/barkimedes/go-deepcopy v0.0.0-20200817023428-a044a1957ca4
 	github.com/contiv/libovsdb v0.0.0
 	github.com/contiv/ofnet v0.0.0-00010101000000-000000000000
 	github.com/fatih/color v1.7.0

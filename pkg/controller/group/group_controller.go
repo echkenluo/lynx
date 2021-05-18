@@ -142,6 +142,7 @@ func (r *GroupReconciler) updateEndpoint(e event.UpdateEvent, q workqueue.RateLi
 		klog.Errorf("DeleteEndpoint received with unavailable object event: %v", e)
 		return
 	}
+	klog.Infof("groupReconciler process endpoint update event for oldEndpoint: %v, newEndpoint: %v", oldEndpoint.Name, newEndpoint.Name)
 
 	if labels.Equals(newEndpoint.Labels, oldEndpoint.Labels) &&
 		utils.EqualIPs(newEndpoint.Status.IPs, oldEndpoint.Status.IPs) {

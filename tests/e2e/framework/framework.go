@@ -454,6 +454,28 @@ func runOpenflowCmd(cmd, brName string) ([]byte, error) {
 	return out, nil
 }
 
+func DumpRawFlows(brName string) ([]byte, error) {
+	cmdStr := fmt.Sprintf("sudo /usr/bin/ovs-ofctl -O Openflow13 dump-flows %s", brName)
+	out, err := exec.Command("/bin/sh", "-c", cmdStr).Output()
+	if err != nil {
+		klog.Errorf("error running ovs-ofctl dump-flows %s. Error: %v", brName, err)
+		return nil, err
+	}
+
+	return out, nil
+}
+
+func DumpControllerLog() ([]byte, error) {
+	cmdStr := fmt.Sprintf("sudo cat /var/log/lynx-controller.log")
+	out, err := exec.Command("/bin/sh", "-c", cmdStr).Output()
+	if err != nil {
+		klog.Errorf("failed dump lynx-controller log, Error: %v", err)
+		return nil, err
+	}
+
+	return out, nil
+}
+
 // dump the flows and parse the Output
 func (f *Framework) FlowDump(brName string) ([]string, error) {
 	flowDump, err := runOpenflowCmd("dump-flows", brName)

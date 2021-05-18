@@ -308,21 +308,34 @@ var _ = Describe("SecurityPolicy", func() {
 			})
 
 			It("Isolated vm should not allow to communicate with all of vm except forensic defined allowed endpoint", func() {
+				out, _ := framework.DumpRawFlows(DefaultBridgeName)
+				fmt.Printf("forensic current flow, before update endpoint ip, out: %v\n", string(out))
 				assertReachable([]*framework.VM{nginx, server01, server02, db02}, []*framework.VM{db01}, "TCP", false)
 				assertReachable([]*framework.VM{db01}, []*framework.VM{nginx, server01, server02, db02}, "TCP", false)
+				out1, _ := framework.DumpRawFlows(DefaultBridgeName)
+				fmt.Printf("forensic current flow, before update endpoint ip, out1: %v\n", string(out1))
 
 				assertReachable([]*framework.VM{client}, []*framework.VM{db01}, "TCP", true)
 			})
 
-			When("forensic update vm status after setup policy", func() {
+			When("forensic policy enforcement: update vm status after enforce forensic policy", func() {
 				BeforeEach(func() {
 					Expect(e2eEnv.UpdateVMRandIP(db01)).Should(Succeed())
+					controllerlog, _ := framework.DumpControllerLog()
+					fmt.Printf("#### lynx-controller log: %v\n", string(controllerlog))
 				})
 
 				It("Isolated vm should not allow to communicate with all of vm except forensic defined allowed endpoint", func() {
+					out, _ := framework.DumpRawFlows(DefaultBridgeName)
+					fmt.Printf("forensic current flow, after update endpoint ip, out: %v\n", string(out))
+					controllerlog, _ := framework.DumpControllerLog()
+					fmt.Printf("#### lynx-controller log: %v\n", string(controllerlog))
+
 					assertReachable([]*framework.VM{nginx, server01, server02, db02}, []*framework.VM{db01}, "TCP", false)
 					assertReachable([]*framework.VM{db01}, []*framework.VM{client, nginx, server01, server02, db02}, "TCP", false)
 
+					out1, _ := framework.DumpRawFlows(DefaultBridgeName)
+					fmt.Printf("forensic current flow, after update endpoint ip, out1: %v\n", string(out1))
 					assertReachable([]*framework.VM{client}, []*framework.VM{db01}, "TCP", true)
 				})
 			})
